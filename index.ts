@@ -1,64 +1,135 @@
 import { BskyAgent } from '@atproto/api';
+import { BlobRef } from '@atproto/lexicon';
+import { RichText } from '@atproto/api'
 import * as dotenv from 'dotenv';
-import { CronJob } from 'cron';
 import * as process from 'process';
 import * as fs from 'node:fs';
-import * as path from 'node:path';
-import { unescape } from 'node:querystring';
 
 dotenv.config();
 
-// Create a Bluesky Agent 
-const agent = new BskyAgent({
-    service: 'https://bsky.social',
-})
+type Image = {
+    id: string,
+    title: string,
+    date: string,
+    homepageUrl: string,
+    downloadUrl: string
+};
 
+function getMediaList(path): Image[] {
+    const json = fs
+        .readFileSync(path)
+        .toString('utf8');
+    const media = JSON.parse(json);
+    return media;
+}
+
+function getRandom<T>(arr: T[]): T {
+    return arr[arr.length * Math.random() | 0];
+}
+
+async function getImageDataBlob(fileUrl: string) {
+    console.log(`Fetching URL: ${fileUrl}`);
+    const imageBlob = await (await fetch(fileUrl)).blob();
+    console.log(`Size: ${imageBlob.size}`)
+    console.log(`MIME type: ${imageBlob.type})`);
+    return imageBlob;
+}
 
 async function main() {
-    // get a random file from the list
-    let basename: string;
+    const mediaJsonPath = "./media.json";
+
+    console.log(`Reading media list from ${mediaJsonPath}...`);
+    const images = getMediaList(mediaJsonPath);
+    console.log(`Got ${images.length} images.`);
+
+    let image: Image;
     let imageBlob: Blob;
+    let validImage = false;
+    let attempts = 0;
     do {
-        const fileUrls = fs
-            .readFileSync(process.env.IMAGE_LIST_NAME!)
-            .toString('utf8')
-            .split('\n');
-        const fileUrl = fileUrls[fileUrls.length * Math.random() | 0];
-        basename = fileUrl.slice(fileUrl.lastIndexOf('/') + 1);
-        basename = unescape(basename);
+        if (attempts > 10) {
+            throw new Error("Too many tries to get a valid image.");
+        }
+        image = getRandom(images);
+        console.log(`Randomly chosen image: `, image);
 
-        console.log(`Fetching file... ${fileUrl}`);
-        imageBlob = await (await fetch(fileUrl)).blob();
-        console.log(`Got ${basename} (size=${imageBlob.size},type=${imageBlob.type})`);
-    } while (!imageBlob.type.startsWith("image/") || imageBlob.size > 976000)
+        console.log(`Downloading image data...`);
+        imageBlob = await getImageDataBlob(image.downloadUrl);
 
-    console.log(`Logging in as ${process.env.BLUESKY_USERNAME!}...`);
-    await agent.login({ identifier: process.env.BLUESKY_USERNAME!, password: process.env.BLUESKY_PASSWORD! })
+
+        validImage = isBlobMimeTypeImage(imageBlob) || imageBlob.size > 976000;
+        attempts += 1;
+    } while (!validImage);
+
+    const agent = await loginToBluesky();
 
     console.log(`Uploading image as blob...`);
-    const uploadBlobRespose = await agent.uploadBlob(await imageBlob.bytes(), {
+    const blobRef = await uploadBlobToBluesky(agent, imageBlob);
+
+
+    await postToBluesky(image, blobRef, agent);
+}
+
+main();
+
+async function postToBluesky(image: Image, blobRef: BlobRef, agent: BskyAgent) {
+    const postText = `${image.title}\n${image.homepageUrl}`;
+    const postAltText = `Photo titled "${image.title}" by Nine Inch Nails taken on ${image.date}`;
+    const rt = new RichText({
+        text: postText
+    })
+    await rt.detectFacets(agent) // automatically detects mentions and links
+    const postRecord = {
+        $type: 'app.bsky.feed.post',
+        text: rt.text,
+        facets: rt.facets,
+        createdAt: new Date().toISOString(),
+        embed: {
+            $type: "app.bsky.embed.images",
+            images: [{
+                image: blobRef,
+                alt: postAltText
+            }]
+        }
+    }
+
+    const postResponse = await agent.post(postRecord);
+
+    console.log(`Just posted! ${postResponse.cid}`);
+    console.log(`URI: ${postResponse.uri}`);
+    postResponse.uri;
+}
+
+async function uploadBlobToBluesky(agent: BskyAgent, imageBlob: Blob): Promise<BlobRef> {
+    const response = await agent.uploadBlob(await imageBlob.bytes(), {
         "encoding": "",
         "headers": {
             "Content-Type": imageBlob.type
         }
     });
-    const blobRef = uploadBlobRespose.data.blob;
+
+    const blobRef = response.data.blob;
     console.log(`Successfully uploaded blob (ref=${blobRef.toJSON()})`);
 
-    const postText = "File:" + basename.replaceAll("_", " ");
-
-    const postResponse = await agent.post({
-        text: postText,
-        embed: {
-            $type: "app.bsky.embed.images",
-            images: [{
-                alt: path.basename(basename),
-                image: blobRef
-            }]
-        }
-    });
-
-    console.log(`Just posted! ${postResponse.cid}`);
+    return blobRef;
 }
 
-main();
+async function loginToBluesky(): Promise<BskyAgent> {
+    const agent = new BskyAgent({
+        service: 'https://bsky.social',
+    })
+
+    console.log(`Logging in with ${process.env.BLUESKY_USERNAME!}...`);
+
+    const response = await agent.login({ identifier: process.env.BLUESKY_USERNAME!, password: process.env.BLUESKY_PASSWORD! });
+
+    console.log(`Logged in as @${response.data.handle}.`);
+
+    return agent;
+}
+
+function isBlobMimeTypeImage(imageBlob: Blob) {
+    return imageBlob.type.startsWith("image/");
+}
+
+
